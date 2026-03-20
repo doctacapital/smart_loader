@@ -23,6 +23,7 @@ TABLE_PATHS = {
     "bond_clean": "bond_clean_prices",
     "yield_by_date": "yield_bonds/by_date",
     "yield_by_ticker": "yield_bonds/by_ticker",
+    "hist_fci": "historical_fcis",
 }
 
 
