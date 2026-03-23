@@ -234,8 +234,19 @@ class SmartLoader:
         for ticker, date_str in ticker_date_pairs:
             by_ticker.setdefault(ticker, []).append(date_str)
 
+        # Migrate any old STRING keys to HASH before HMGET
+        type_pipe = self._redis.pipeline(transaction=False)
+        tickers_list = list(by_ticker.keys())
+        for ticker in tickers_list:
+            type_pipe.type(f"{TIER2_CACHE_PREFIX}{table}:{ticker}")
+        types = type_pipe.execute()
+
+        for ticker, key_type in zip(tickers_list, types):
+            if key_type == "string":
+                self.get_ticker_series(table, ticker)  # auto-migrates to hash
+
         # Pipeline HMGET — 1 round-trip for all tickers
-        pipe = self._redis.pipeline()
+        pipe = self._redis.pipeline(transaction=False)
         ticker_order = []
         for ticker, dates in by_ticker.items():
             cache_key = f"{TIER2_CACHE_PREFIX}{table}:{ticker}"
