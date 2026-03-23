@@ -12,7 +12,7 @@ import json
 import logging
 import os
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import redis
@@ -172,9 +172,8 @@ class SmartLoader:
         """
         Get historical series for a single ticker.
 
-        1. Check Redis per-ticker cache: ts:cache:{table}:{ticker}
-        2. HIT → return (sub-ms)
-        3. MISS → load from S3 Parquet → cache in Redis (TTL 24h) → return
+        Storage: Redis Hash where each field is a date and value is the JSON record.
+        Backward compat: auto-migrates old STRING format to HASH on read.
 
         Args:
             table: Tier 2 table name (e.g., "hist_adj", "bond_clean", "yield_by_ticker")
@@ -185,19 +184,106 @@ class SmartLoader:
         """
         cache_key = f"{TIER2_CACHE_PREFIX}{table}:{ticker}"
 
-        # 1. Check Redis cache
-        cached = self._redis.get(cache_key)
-        if cached is not None:
-            return json.loads(cached)
+        # 1. Check key type for backward compat
+        key_type = self._redis.type(cache_key)
 
-        # 2. Cache miss — load from S3 Parquet
+        if key_type == "hash":
+            hash_data = self._redis.hgetall(cache_key)
+            if hash_data:
+                return [json.loads(v) for v in hash_data.values()]
+
+        elif key_type == "string":
+            # Old format — read, migrate to hash
+            cached = self._redis.get(cache_key)
+            if cached is not None:
+                data = json.loads(cached)
+                self._redis.delete(cache_key)
+                self._cache_as_hash(cache_key, data)
+                return data
+
+        # 2. Cache miss — load from S3 Parquet, cache as hash
         data = self._parquet_reader.read_ticker(table, ticker)
-
-        # 3. Cache in Redis with TTL
         if data:
-            self._redis.setex(cache_key, TIER2_CACHE_TTL, json.dumps(data, default=str))
+            self._cache_as_hash(cache_key, data)
 
         return data
+
+    def get_prices_for_dates(
+        self, table: str, ticker_date_pairs: List[Tuple[str, str]],
+    ) -> Dict[Tuple[str, str], Dict]:
+        """
+        Batch fetch specific dates for specific tickers via pipelined HMGET.
+
+        Much faster than get_ticker_series when only a few dates are needed
+        per ticker (e.g., 20 dates out of 2500 records).
+
+        Falls back to S3 for tickers not yet cached.
+
+        Args:
+            table: Tier 2 table name (e.g., "hist_adj")
+            ticker_date_pairs: List of (ticker, date_iso_str) tuples
+
+        Returns:
+            Dict mapping (ticker, date_str) → record dict
+        """
+        if not ticker_date_pairs:
+            return {}
+
+        # Group by ticker
+        by_ticker: Dict[str, List[str]] = {}
+        for ticker, date_str in ticker_date_pairs:
+            by_ticker.setdefault(ticker, []).append(date_str)
+
+        # Pipeline HMGET — 1 round-trip for all tickers
+        pipe = self._redis.pipeline()
+        ticker_order = []
+        for ticker, dates in by_ticker.items():
+            cache_key = f"{TIER2_CACHE_PREFIX}{table}:{ticker}"
+            pipe.hmget(cache_key, *dates)
+            ticker_order.append((ticker, dates))
+        results = pipe.execute()
+
+        # Parse hits, identify tickers with complete miss (hash not populated)
+        output: Dict[Tuple[str, str], Dict] = {}
+        tickers_to_load = []
+        for (ticker, dates), values in zip(ticker_order, results):
+            if all(v is None for v in values):
+                tickers_to_load.append(ticker)
+            else:
+                for date_str, val in zip(dates, values):
+                    if val is not None:
+                        output[(ticker, date_str)] = json.loads(val)
+
+        # Load missing tickers from S3 → populate hash → retry HMGET
+        if tickers_to_load:
+            for ticker in tickers_to_load:
+                self.get_ticker_series(table, ticker)
+
+            pipe = self._redis.pipeline()
+            retry_order = []
+            for ticker in tickers_to_load:
+                dates = by_ticker[ticker]
+                pipe.hmget(f"{TIER2_CACHE_PREFIX}{table}:{ticker}", *dates)
+                retry_order.append((ticker, dates))
+            retry_results = pipe.execute()
+
+            for (ticker, dates), values in zip(retry_order, retry_results):
+                for date_str, val in zip(dates, values):
+                    if val is not None:
+                        output[(ticker, date_str)] = json.loads(val)
+
+        return output
+
+    def _cache_as_hash(self, cache_key: str, data: List[Dict]) -> None:
+        """Store a list of records as a Redis Hash (field=date, value=JSON record)."""
+        if not data:
+            return
+        pipe = self._redis.pipeline()
+        for record in data:
+            date_str = str(record.get("date", "unknown"))
+            pipe.hset(cache_key, date_str, json.dumps(record, default=str))
+        pipe.expire(cache_key, TIER2_CACHE_TTL)
+        pipe.execute()
 
     def get_market_series(self, table: str, market: str) -> Dict[str, List[Dict]]:
         """
@@ -224,16 +310,13 @@ class SmartLoader:
                 self._redis.setex(cache_key, TIER2_CACHE_TTL, json.dumps(data, default=str))
             return data or {}
 
-        # For market-partitioned tables, load the partition and cache per-ticker
+        # For market-partitioned tables, load the partition and cache per-ticker as hash
         all_tickers = self._parquet_reader.read_market_partition(table, market)
 
-        # Cache each ticker individually
         if all_tickers:
-            pipe = self._redis.pipeline()
             for ticker, records in all_tickers.items():
                 cache_key = f"{TIER2_CACHE_PREFIX}{table}:{ticker}"
-                pipe.setex(cache_key, TIER2_CACHE_TTL, json.dumps(records, default=str))
-            pipe.execute()
+                self._cache_as_hash(cache_key, records)
 
         return all_tickers or {}
 
