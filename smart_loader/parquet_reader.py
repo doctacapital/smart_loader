@@ -214,8 +214,8 @@ class ParquetReader:
             date_str = date_val.isoformat() if hasattr(date_val, "isoformat") else str(date_val)
             result[date_str] = {}
 
-            if "submarket_type" in df.columns:
-                for submarket, sub_group in date_group.groupby("submarket_type"):
+            if "submarket" in df.columns:
+                for submarket, sub_group in date_group.groupby("submarket"):
                     result[date_str][submarket] = self._df_to_records(sub_group)
             else:
                 result[date_str] = self._df_to_records(date_group)
