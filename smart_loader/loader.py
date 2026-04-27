@@ -34,6 +34,7 @@ TIER2_CACHE_TTL = 86400  # 24 hours
 TIER1_DATAFRAME_KEYS = [
     "bonds",
     "cer",
+    "uva",
     "floating_bands",
     "docta_tickers",
     "species",
