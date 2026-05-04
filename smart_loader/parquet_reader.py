@@ -12,6 +12,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 import boto3
+from botocore.config import Config
 import pyarrow.parquet as pq
 
 logger = logging.getLogger(__name__)
@@ -33,9 +34,12 @@ class ParquetReader:
     def __init__(self, bucket: str, prefix: str = "v1"):
         self._bucket = bucket
         self._prefix = prefix
+        # max_pool_connections=32 to support concurrent ticker fetches from
+        # asyncio.to_thread callers (nexus historical_controller uses 16 threads/worker).
         self._s3 = boto3.client(
             "s3",
             region_name=os.environ.get("AWS_REGION", "us-east-1"),
+            config=Config(max_pool_connections=32),
         )
 
     def read_ticker(self, table: str, ticker: str) -> List[Dict]:
