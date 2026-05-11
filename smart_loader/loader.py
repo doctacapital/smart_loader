@@ -44,6 +44,7 @@ TIER1_DATAFRAME_KEYS = [
     "badlar",
     "a3500",
     "tc-minorista",
+    "eur_prices",
 ]
 
 # Tier 1 tables stored as JSON dicts in Redis
