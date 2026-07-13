@@ -8,12 +8,17 @@ ON CONFLICT (lower(name)) DO NOTHING;
 INSERT INTO dwh.instrument (kind, name, denom_currency) VALUES
     ('STOCK',   'Test GGAL SA',       'ARS'),
     ('CEDEAR',  'Test NVDA CEDEAR',   'ARS'),
-    ('BOND',    'Test AL30 Bond',     'ARS');
+    ('BOND',    'Test AL30 Bond',     'ARS'),
+    ('STOCK',   'Test Segmented SA',  'ARS');
 
 INSERT INTO dwh.series (instrument_id, mic, symbol, segment, settlement, trade_currency, is_cable) VALUES
     ((SELECT instrument_id FROM dwh.instrument WHERE name = 'Test GGAL SA'),     'XBUE', 'TSTGGAL', '-', '24H', 'ARS', false),
     ((SELECT instrument_id FROM dwh.instrument WHERE name = 'Test NVDA CEDEAR'), 'XBUE', 'TSTNVDA', '-', '24H', 'ARS', false),
-    ((SELECT instrument_id FROM dwh.instrument WHERE name = 'Test AL30 Bond'),   'XBUE', 'TSTAL30', '-', '24H', 'ARS', false);
+    ((SELECT instrument_id FROM dwh.instrument WHERE name = 'Test AL30 Bond'),   'XBUE', 'TSTAL30', '-', '24H', 'ARS', false),
+    -- segment='CT' (not the promoter's standard '-' sentinel) — the pg_reader
+    -- resolution filter must NOT pick this up via the standard hist_raw path
+    -- (DPM-395 F1: natural key is (mic,symbol,segment,settlement)).
+    ((SELECT instrument_id FROM dwh.instrument WHERE name = 'Test Segmented SA'), 'XBUE', 'TSTSEG', 'CT', '24H', 'ARS', false);
 
 -- Alias: an old symbol that used to point at TSTGGAL's series.
 INSERT INTO dwh.series_alias (series_id, symbol, valid_from, source) VALUES
@@ -42,6 +47,11 @@ INSERT INTO dwh.eod_bar (series_id, trade_date, open, high, low, close, volume, 
 INSERT INTO dwh.eod_bar (series_id, trade_date, open, high, low, close, volume, turnover, source) VALUES
     ((SELECT series_id FROM dwh.series WHERE symbol = 'TSTAL30'), '2024-01-02', 50, 51, 49, 50.5, 10, 500, 'TEST'),
     ((SELECT series_id FROM dwh.series WHERE symbol = 'TSTAL30'), '2024-01-03', 50.5, 51.5, 49.5, 51, 12, 600, 'TEST');
+
+-- TSTSEG (segment='CT'): has real bars, but must NOT resolve via the
+-- standard hist_raw path (segment != '-').
+INSERT INTO dwh.eod_bar (series_id, trade_date, open, high, low, close, volume, turnover, source) VALUES
+    ((SELECT series_id FROM dwh.series WHERE symbol = 'TSTSEG'), '2024-01-02', 10, 11, 9, 10.5, 5, 50, 'TEST');
 
 -- MEP fx_rate for TSTGGAL, all dates except the last one (2024-01-09) — tests
 -- the "no MEP for this date" -> usd_mep fields None case.

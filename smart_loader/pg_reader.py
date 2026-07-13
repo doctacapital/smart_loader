@@ -60,15 +60,19 @@ WITH direct AS (
     JOIN dwh.instrument i ON i.instrument_id = s.instrument_id
     WHERE s.symbol = %(ticker)s
       AND s.mic = %(mic)s
+      AND s.segment = '-'
       AND s.settlement = '24H'
       AND i.kind = ANY(%(kinds)s)
 ), via_alias AS (
+    -- valid_from/valid_to intentionally NOT filtered: a historical lookup
+    -- must still resolve a retired/renamed symbol_raw even past its expiry.
     SELECT s.series_id, s.trade_currency, 2 AS pref
     FROM dwh.series_alias a
     JOIN dwh.series s ON s.series_id = a.series_id
     JOIN dwh.instrument i ON i.instrument_id = s.instrument_id
     WHERE a.symbol = %(ticker)s
       AND s.mic = %(mic)s
+      AND s.segment = '-'
       AND s.settlement = '24H'
       AND i.kind = ANY(%(kinds)s)
 )
@@ -112,6 +116,7 @@ LEFT JOIN dwh.fx_rate fx
       AND fx.quote_currency = 'ARS'
       AND fx.rate_type = 'MEP'
 WHERE s.mic = %(mic)s
+  AND s.segment = '-'
   AND s.settlement = '24H'
   AND i.kind = %(kind)s
 ORDER BY s.symbol, b.trade_date
@@ -124,6 +129,7 @@ FROM dwh.eod_bar b
 JOIN dwh.series s ON s.series_id = b.series_id
 JOIN dwh.instrument i ON i.instrument_id = s.instrument_id
 WHERE s.mic = %(mic)s
+  AND s.segment = '-'
   AND s.settlement = '24H'
   AND i.kind = %(kind)s
 ORDER BY s.symbol, b.trade_date
@@ -292,12 +298,21 @@ class PostgresReader:
             return {}
 
         mic = TABLE_MIC.get(table, "XBUE")
+        # Per-call metadata memoization: _metadata_for does a DataFrame .loc
+        # scan per invocation — without this a partition with N rows across
+        # T tickers costs O(N) lookups instead of O(T) (perf fix, DPM-395).
+        meta_cache: Dict[str, Optional[Dict[str, Any]]] = {}
+
+        def metadata_for(ticker: str) -> Optional[Dict[str, Any]]:
+            if ticker not in meta_cache:
+                meta_cache[ticker] = self._metadata_for(ticker)
+            return meta_cache[ticker]
 
         if table == "hist_raw":
             rows = self._query(_BAR_PARTITION_SQL, {"mic": mic, "kind": kind})
             records = [
                 build_hist_raw_record(
-                    row["ticker"], row, self._metadata_for(row["ticker"]),
+                    row["ticker"], row, metadata_for(row["ticker"]),
                     currency=row["trade_currency"],
                 )
                 for row in rows
@@ -308,7 +323,7 @@ class PostgresReader:
             rows = self._query(_BAR_MEP_PARTITION_SQL, {"mic": mic, "kind": kind})
             records = [
                 build_hist_adj_record(
-                    row["ticker"], row, self._metadata_for(row["ticker"]),
+                    row["ticker"], row, metadata_for(row["ticker"]),
                     currency=row["trade_currency"],
                 )
                 for row in rows

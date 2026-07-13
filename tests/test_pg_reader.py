@@ -64,6 +64,13 @@ def test_bond_excluded_from_hist_raw_by_kind_filter(reader):
     assert reader.read_ticker("hist_raw", "TSTAL30") == []
 
 
+def test_segmented_series_not_resolved_by_standard_path(reader):
+    # DPM-395 F1: natural key is (mic, symbol, segment, settlement) — a
+    # series with segment='CT' (not the promoter's '-' sentinel) has real
+    # eod_bar rows but must NOT resolve via the standard hist_raw path.
+    assert reader.read_ticker("hist_raw", "TSTSEG") == []
+
+
 # ── §3 record shape ──
 
 def test_hist_raw_record_shape_and_types(reader):
