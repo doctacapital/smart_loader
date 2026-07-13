@@ -18,6 +18,7 @@ import pandas as pd
 import redis
 
 from smart_loader.parquet_reader import ParquetReader
+from smart_loader.pg_reader import PostgresReader
 
 logger = logging.getLogger(__name__)
 
@@ -98,15 +99,90 @@ class SmartLoader:
 
         self._s3_bucket = s3_bucket or os.environ.get("DB_TABLES_S3_BUCKET", "docta-db-tables")
         self._s3_prefix = s3_prefix
+        # Fallback backend always built, regardless of SMART_LOADER_BACKEND — pg
+        # only ever covers the tables listed in SMART_LOADER_PG_TABLES (DPM-395 §1).
         self._parquet_reader = ParquetReader(self._s3_bucket, self._s3_prefix)
 
         # Tier 1 data loaded at startup
         self._tier1_data: Dict[str, Any] = {}
 
+        self._backend = os.environ.get("SMART_LOADER_BACKEND", "s3").lower()
+        if self._backend not in ("s3", "pg"):
+            logger.warning(
+                f"Unknown SMART_LOADER_BACKEND={self._backend!r}, falling back to s3"
+            )
+            self._backend = "s3"
+
+        pg_tables_raw = os.environ.get("SMART_LOADER_PG_TABLES", "hist_adj,hist_raw")
+        self._pg_tables = {t.strip() for t in pg_tables_raw.split(",") if t.strip()}
+
+        self._pg_reader: Optional[PostgresReader] = None
+        if self._backend == "pg":
+            dsn = os.environ.get("SMART_LOADER_PG_DSN")
+            if not dsn:
+                raise ValueError(
+                    "SMART_LOADER_BACKEND=pg requires SMART_LOADER_PG_DSN (fail-fast at startup)"
+                )
+            pool_min = int(os.environ.get("SMART_LOADER_PG_POOL_MIN", 1))
+            pool_max = int(os.environ.get("SMART_LOADER_PG_POOL_MAX", 8))
+            self._pg_reader = PostgresReader(
+                dsn,
+                pool_min=pool_min,
+                pool_max=pool_max,
+                metadata_provider=self._tier1_ticker_meta,
+            )
+
         logger.info(
             f"SmartLoader initialized: redis={self._redis_host}:{self._redis_port}/db{redis_db}, "
-            f"s3={self._s3_bucket}/{self._s3_prefix}"
+            f"s3={self._s3_bucket}/{self._s3_prefix}, backend={self._backend}, "
+            f"pg_tables={sorted(self._pg_tables)}"
         )
+
+    def _reader_for(self, table: str):
+        """Tier 2 backend selector (§1): pg only for tables in
+        SMART_LOADER_PG_TABLES, s3/Parquet otherwise (default fallback)."""
+        if self._pg_reader is not None and table in self._pg_tables:
+            return self._pg_reader
+        return self._parquet_reader
+
+    def _tier1_ticker_meta(self, ticker: str) -> Optional[Dict[str, Any]]:
+        """metadata_provider for PostgresReader (§5.3): enriches dwh bar rows
+        with the legacy per-ticker fields dwh doesn't carry on eod_bar.
+
+        NOTE on the §5.3 halt (resolved by planner): `currency` is NOT part
+        of this provider's contract anymore — PostgresReader sources it from
+        dwh.series.trade_currency (per-serie) and injects it directly into
+        the record, bypassing metadata_provider entirely. That's because the
+        Tier1 `docta_tickers` DataFrame (ts:docta_tickers, Supabase `tickers`
+        table) only has columns `tickers`/`market_type`/`submarket_type`/
+        `name`/`sector`/*_id/`isin_code` — confirmed via nexus/utils.py and
+        cronos/services/redis_timeseries_service.py:540-542 — with no
+        per-ticker currency column at all.
+
+        `specie`/`current_closing_price` stay None permanently (planner
+        decision: their only historical source is real-time L2 quote
+        payloads — cronos/utils/data_helpers.py:49-65 — which SmartLoader's
+        Tier 1 never loads, and nothing downstream reads them materially).
+        `submarket` is populated from the real `submarket_type` column;
+        `settlement_period` uses the spec's explicit fallback constant
+        "24hs" (§5.3), ratified by the planner."""
+        tickers_df = self._tier1_data.get("docta_tickers")
+        if tickers_df is None or getattr(tickers_df, "empty", True):
+            return None
+        if "tickers" not in tickers_df.columns:
+            return None
+
+        match = tickers_df.loc[tickers_df["tickers"] == ticker]
+        if match.empty:
+            return None
+
+        row = match.iloc[0]
+        return {
+            "specie": None,
+            "submarket": row.get("submarket_type"),
+            "current_closing_price": None,
+            "settlement_period": "24hs",
+        }
 
     # ── Tier 1: reference data (startup, same as current pattern) ──
 
@@ -203,8 +279,8 @@ class SmartLoader:
                 self._cache_as_hash(cache_key, data)
                 return data
 
-        # 2. Cache miss — load from S3 Parquet, cache as hash
-        data = self._parquet_reader.read_ticker(table, ticker)
+        # 2. Cache miss — load from Tier 2 backend (pg or S3 Parquet), cache as hash
+        data = self._reader_for(table).read_ticker(table, ticker)
         if data:
             self._cache_as_hash(cache_key, data)
 
@@ -318,13 +394,13 @@ class SmartLoader:
             cached = self._redis.get(cache_key)
             if cached is not None:
                 return json.loads(cached)
-            data = self._parquet_reader.read_full_table(table)
+            data = self._reader_for(table).read_full_table(table)
             if data:
                 self._redis.setex(cache_key, TIER2_CACHE_TTL, json.dumps(data, default=str))
             return data or {}
 
         # For market-partitioned tables, load the partition and cache per-ticker as hash
-        all_tickers = self._parquet_reader.read_market_partition(table, market)
+        all_tickers = self._reader_for(table).read_market_partition(table, market)
 
         if all_tickers:
             for ticker, records in all_tickers.items():
