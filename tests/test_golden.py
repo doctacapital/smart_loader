@@ -83,11 +83,25 @@ def _load_meta_stub(ticker):
 
 META_FIELDS = ("settlement_period", "currency", "specie", "submarket", "current_closing_price")
 
+# Planner resolution of the §5.3 halt (DPM-395): only these two META_FIELDS
+# are asserted on the last record. `currency`/`specie`/`current_closing_price`
+# are report-only — logged as `meta_report`, never asserted — because
+# `specie`/`current_closing_price` have no dwh source at all (permanent
+# None) and `currency` now comes from dwh.series.trade_currency rather than
+# the legacy per-ticker metadata, so a literal mismatch is expected/possible.
+# TODO(planner): if capture_golden.py shows v1's `currency` is byte-for-byte
+# identical to `series.trade_currency` across witnesses, promote `currency`
+# to ASSERTED_META_FIELDS.
+ASSERTED_META_FIELDS = ("settlement_period", "submarket")
+REPORT_ONLY_META_FIELDS = ("currency", "specie", "current_closing_price")
+
 
 def compare_records(v1_records, v2_records):
     """Classifies differences per §8: fechas-solo-v1 / solo-v2 / value diffs.
     NaN treated as equivalent to None. META_FIELDS compared only on the last
-    record (§7.3). Never asserts opaquely — returns a structured report."""
+    record (§7.3); within META_FIELDS, only ASSERTED_META_FIELDS feed
+    `value_diffs` — REPORT_ONLY_META_FIELDS go to `meta_report` instead.
+    Never asserts opaquely — returns a structured report."""
     by_date_v1 = {r["date"]: r for r in v1_records}
     by_date_v2 = {r["date"]: r for r in v2_records}
 
@@ -96,6 +110,7 @@ def compare_records(v1_records, v2_records):
     common_dates = sorted(set(by_date_v1) & set(by_date_v2))
 
     value_diffs = {}
+    meta_report = {}
     last_date = common_dates[-1] if common_dates else None
 
     for date in common_dates:
@@ -112,12 +127,16 @@ def compare_records(v1_records, v2_records):
                     continue
             elif v1v == v2v:
                 continue
-            value_diffs.setdefault(date, {})[key] = (v1v, v2v)
+            if key in REPORT_ONLY_META_FIELDS:
+                meta_report.setdefault(date, {})[key] = (v1v, v2v)
+            else:
+                value_diffs.setdefault(date, {})[key] = (v1v, v2v)
 
     return {
         "dates_only_v1": dates_only_v1,
         "dates_only_v2": dates_only_v2,
         "value_diffs": value_diffs,
+        "meta_report": meta_report,
     }
 
 
@@ -143,6 +162,11 @@ def test_golden_v1_vs_v2(seeded_pg_dsn, table, ticker):
     assert len(v2_records) > 0, f"v2 (PostgresReader) for {table}/{ticker} returned 0 records"
 
     report = compare_records(v1_records, v2_records)
+
+    # Report-only (planner decision, §5.3): log, never assert.
+    if report["meta_report"]:
+        print(f"[meta_report, non-blocking] {table}/{ticker}: {report['meta_report']}")
+
     assert report["value_diffs"] == {}, f"value diffs for {table}/{ticker}: {report['value_diffs']}"
     assert report["dates_only_v1"] == [], (
         f"dates only in v1 for {table}/{ticker} (v2 coverage gap): {report['dates_only_v1']}"

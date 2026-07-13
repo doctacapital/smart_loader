@@ -55,7 +55,7 @@ MARKET_KIND = {
 
 _RESOLVE_SQL = """
 WITH direct AS (
-    SELECT s.series_id, 1 AS pref
+    SELECT s.series_id, s.trade_currency, 1 AS pref
     FROM dwh.series s
     JOIN dwh.instrument i ON i.instrument_id = s.instrument_id
     WHERE s.symbol = %(ticker)s
@@ -63,7 +63,7 @@ WITH direct AS (
       AND s.settlement = '24H'
       AND i.kind = ANY(%(kinds)s)
 ), via_alias AS (
-    SELECT s.series_id, 2 AS pref
+    SELECT s.series_id, s.trade_currency, 2 AS pref
     FROM dwh.series_alias a
     JOIN dwh.series s ON s.series_id = a.series_id
     JOIN dwh.instrument i ON i.instrument_id = s.instrument_id
@@ -72,7 +72,7 @@ WITH direct AS (
       AND s.settlement = '24H'
       AND i.kind = ANY(%(kinds)s)
 )
-SELECT series_id FROM (
+SELECT series_id, trade_currency FROM (
     SELECT * FROM direct UNION ALL SELECT * FROM via_alias
 ) u
 ORDER BY pref
@@ -100,7 +100,7 @@ ORDER BY b.trade_date
 """
 
 _BAR_MEP_PARTITION_SQL = """
-SELECT s.symbol AS ticker, b.trade_date::text AS date,
+SELECT s.symbol AS ticker, s.trade_currency, b.trade_date::text AS date,
        b.open, b.high, b.low, b.close, b.volume, b.turnover,
        fx.value AS mep_rate
 FROM dwh.eod_bar b
@@ -118,7 +118,7 @@ ORDER BY s.symbol, b.trade_date
 """
 
 _BAR_PARTITION_SQL = """
-SELECT s.symbol AS ticker, b.trade_date::text AS date,
+SELECT s.symbol AS ticker, s.trade_currency, b.trade_date::text AS date,
        b.open, b.high, b.low, b.close, b.volume, b.turnover
 FROM dwh.eod_bar b
 JOIN dwh.series s ON s.series_id = b.series_id
@@ -188,10 +188,11 @@ class PostgresReader:
         self._metadata_provider = metadata_provider
         self._pool = None  # opened lazily on first query (§1)
 
-        # In-process series_id resolution cache. Positive hits only — never
-        # cache misses, so a symbol that resolves later (e.g. after a
-        # promoter run) is picked up without a restart (§2).
-        self._series_id_cache: Dict[tuple, Optional[int]] = {}
+        # In-process series resolution cache: (table, ticker) -> {series_id,
+        # trade_currency}. Positive hits only — never cache misses, so a
+        # symbol that resolves later (e.g. after a promoter run) is picked up
+        # without a restart (§2).
+        self._series_cache: Dict[tuple, Dict[str, Any]] = {}
 
     # ── pool / connection plumbing ──
 
@@ -222,19 +223,24 @@ class PostgresReader:
 
     # ── series resolution (§2) ──
 
-    def _resolve_series_id(self, table: str, ticker: str) -> Optional[int]:
+    def _resolve_series(self, table: str, ticker: str) -> Optional[Dict[str, Any]]:
+        """Resolves (series_id, trade_currency) for ticker@table. `currency`
+        on hist_raw/hist_adj/yield_by_ticker records is sourced from here —
+        dwh.series.trade_currency, per-serie — never from metadata_provider
+        (planner decision on DPM-395 §5.3 halt)."""
         cache_key = (table, ticker)
-        if cache_key in self._series_id_cache:
-            return self._series_id_cache[cache_key]
+        if cache_key in self._series_cache:
+            return self._series_cache[cache_key]
 
         kinds = list(TABLE_KINDS.get(table, ()))
         mic = TABLE_MIC.get(table, "XBUE")
         rows = self._query(_RESOLVE_SQL, {"ticker": ticker, "mic": mic, "kinds": kinds})
-        series_id = rows[0]["series_id"] if rows else None
+        if not rows:
+            return None
 
-        if series_id is not None:
-            self._series_id_cache[cache_key] = series_id
-        return series_id
+        resolved = {"series_id": rows[0]["series_id"], "trade_currency": rows[0]["trade_currency"]}
+        self._series_cache[cache_key] = resolved
+        return resolved
 
     def _metadata_for(self, ticker: str) -> Optional[Dict[str, Any]]:
         if self._metadata_provider is None:
@@ -248,19 +254,21 @@ class PostgresReader:
     # ── ParquetReader-mirrored interface ──
 
     def read_ticker(self, table: str, ticker: str) -> List[Dict]:
-        series_id = self._resolve_series_id(table, ticker)
-        if series_id is None:
+        resolved = self._resolve_series(table, ticker)
+        if resolved is None:
             return []
+        series_id = resolved["series_id"]
+        currency = resolved["trade_currency"]
 
         meta = self._metadata_for(ticker)
 
         if table == "hist_raw":
             rows = self._query(_BAR_SQL, {"sid": series_id})
-            return [build_hist_raw_record(ticker, row, meta) for row in rows]
+            return [build_hist_raw_record(ticker, row, meta, currency=currency) for row in rows]
 
         if table == "hist_adj":
             rows = self._query(_BAR_MEP_SQL, {"sid": series_id})
-            return [build_hist_adj_record(ticker, row, meta) for row in rows]
+            return [build_hist_adj_record(ticker, row, meta, currency=currency) for row in rows]
 
         if table == "bond_clean":
             rows = self._query(_BOND_CLEAN_SQL, {"sid": series_id})
@@ -268,7 +276,7 @@ class PostgresReader:
 
         if table == "yield_by_ticker":
             rows = self._query(_YIELD_SQL, {"sid": series_id})
-            return [build_yield_record(ticker, row, meta) for row in rows]
+            return [build_yield_record(ticker, row, meta, currency=currency) for row in rows]
 
         if table == "hist_fci":
             rows = self._query(_FCI_SQL, {"sid": series_id})
@@ -288,7 +296,10 @@ class PostgresReader:
         if table == "hist_raw":
             rows = self._query(_BAR_PARTITION_SQL, {"mic": mic, "kind": kind})
             records = [
-                build_hist_raw_record(row["ticker"], row, self._metadata_for(row["ticker"]))
+                build_hist_raw_record(
+                    row["ticker"], row, self._metadata_for(row["ticker"]),
+                    currency=row["trade_currency"],
+                )
                 for row in rows
             ]
             return group_records_by_ticker(records)
@@ -296,7 +307,10 @@ class PostgresReader:
         if table == "hist_adj":
             rows = self._query(_BAR_MEP_PARTITION_SQL, {"mic": mic, "kind": kind})
             records = [
-                build_hist_adj_record(row["ticker"], row, self._metadata_for(row["ticker"]))
+                build_hist_adj_record(
+                    row["ticker"], row, self._metadata_for(row["ticker"]),
+                    currency=row["trade_currency"],
+                )
                 for row in rows
             ]
             return group_records_by_ticker(records)

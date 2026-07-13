@@ -83,6 +83,9 @@ def test_hist_raw_record_shape_and_types(reader):
     assert isinstance(first["date"], str)
     assert isinstance(first["closing_price"], float)
     assert first["ticker"] == "TSTGGAL"
+    # currency comes from dwh.series.trade_currency, per-serie (planner
+    # resolution of §5.3 halt) — TSTGGAL's synthetic series is ARS.
+    assert first["currency"] == "ARS"
 
 
 def test_hist_raw_dates_ascending(reader):
@@ -140,25 +143,44 @@ def test_hist_adj_mep_is_a_global_rate_shared_across_tickers(reader):
 
 def test_metadata_provider_present_enriches_record(reader_with_meta):
     records = reader_with_meta.read_ticker("hist_raw", "TSTGGAL")
-    assert records[0]["currency"] == "ARS"
     assert records[0]["specie"] == "P"
     assert records[0]["submarket"] == "STOCK"
     assert records[0]["current_closing_price"] == 108.0
     assert records[0]["settlement_period"] == "24hs"
 
 
-def test_metadata_provider_absent_fields_are_none(reader):
+def test_metadata_provider_currency_key_is_ignored_series_wins(seeded_pg_dsn):
+    # Planner resolution of §5.3: currency is per-serie (dwh.series), never
+    # sourced from metadata_provider — even if a provider returns a
+    # (wrong/stale) "currency" key, it must not leak into the record.
+    def metadata_provider(ticker):
+        return {"currency": "XXX", "specie": None, "submarket": None,
+                "current_closing_price": None, "settlement_period": "24hs"}
+
+    reader = PostgresReader(seeded_pg_dsn, metadata_provider=metadata_provider)
+    try:
+        records = reader.read_ticker("hist_raw", "TSTGGAL")
+        assert records[0]["currency"] == "ARS"  # dwh.series.trade_currency, not "XXX"
+    finally:
+        reader.close()
+
+
+def test_metadata_provider_absent_fields_are_none_except_currency(reader):
+    # currency is populated from dwh.series regardless of metadata_provider.
     records = reader.read_ticker("hist_raw", "TSTGGAL")
-    assert records[0]["currency"] is None
+    assert records[0]["currency"] == "ARS"
     assert records[0]["specie"] is None
     assert records[0]["submarket"] is None
     assert records[0]["current_closing_price"] is None
     assert records[0]["settlement_period"] is None
 
 
-def test_metadata_provider_unknown_ticker_returns_none_fields(reader_with_meta):
+def test_metadata_provider_unknown_ticker_currency_still_resolves(reader_with_meta):
+    # TSTNVDA isn't in the metadata_provider's stub, but currency doesn't
+    # depend on it — it still resolves from dwh.series.
     records = reader_with_meta.read_ticker("hist_raw", "TSTNVDA")
-    assert records[0]["currency"] is None
+    assert records[0]["currency"] == "ARS"
+    assert records[0]["specie"] is None
 
 
 # ── §4.6 read_market_partition ──
@@ -168,6 +190,7 @@ def test_read_market_partition_groups_by_ticker(reader):
     assert "TSTGGAL" in partition
     assert "TSTNVDA" not in partition  # NVDA is CEDEAR, not STOCK
     assert len(partition["TSTGGAL"]) == 6
+    assert partition["TSTGGAL"][0]["currency"] == "ARS"
 
 
 def test_read_market_partition_cedear(reader):

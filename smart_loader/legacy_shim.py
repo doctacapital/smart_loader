@@ -30,10 +30,12 @@ USD_MEP_FIELDS = [
     "effective_volume",
 ]
 
-# Metadata enrichment fields sourced from metadata_provider(ticker) (§5.3)
+# Metadata enrichment fields sourced from metadata_provider(ticker) (§5.3).
+# `currency` is NOT here — per the planner's resolution of the §5.3 halt, it
+# comes from dwh.series.trade_currency (per-serie), passed in explicitly by
+# the caller (PostgresReader), never from metadata_provider/Tier1.
 META_FIELDS = [
     "settlement_period",
-    "currency",
     "specie",
     "submarket",
     "current_closing_price",
@@ -83,15 +85,25 @@ def build_bar_fields(row: Dict[str, Any]) -> Dict[str, Optional[float]]:
     }
 
 
-def build_hist_raw_record(ticker: str, row: Dict[str, Any], meta: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def build_hist_raw_record(
+    ticker: str,
+    row: Dict[str, Any],
+    meta: Optional[Dict[str, Any]],
+    currency: Optional[str] = None,
+) -> Dict[str, Any]:
     """§4.1: hist_raw record (no `id`). Field order mirrors
-    cronos/utils/data_helpers.py:49-65 get_base_ticker_data."""
+    cronos/utils/data_helpers.py:49-65 get_base_ticker_data.
+
+    `currency` is per-serie (dwh.series.trade_currency), supplied by the
+    caller — not sourced from `meta`/metadata_provider (planner resolution
+    of the §5.3 halt: currency is per-serie, specie/current_closing_price
+    have no dwh source and stay None permanently)."""
     meta = meta or EMPTY_META
     record: Dict[str, Any] = {
         "ticker": ticker,
         "settlement_period": meta.get("settlement_period"),
         "date": row["date"],
-        "currency": meta.get("currency"),
+        "currency": currency,
         "specie": meta.get("specie"),
         "submarket": meta.get("submarket"),
     }
@@ -100,9 +112,14 @@ def build_hist_raw_record(ticker: str, row: Dict[str, Any], meta: Optional[Dict[
     return record
 
 
-def build_hist_adj_record(ticker: str, row: Dict[str, Any], meta: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def build_hist_adj_record(
+    ticker: str,
+    row: Dict[str, Any],
+    meta: Optional[Dict[str, Any]],
+    currency: Optional[str] = None,
+) -> Dict[str, Any]:
     """§4.2: hist_raw + USD-MEP columns."""
-    record = build_hist_raw_record(ticker, row, meta)
+    record = build_hist_raw_record(ticker, row, meta, currency=currency)
     mep_rate = to_number(row.get("mep_rate"))
     for field in USD_MEP_FIELDS:
         record[f"{field}_usd_mep"] = usd_mep_value(record.get(field), mep_rate)
@@ -129,10 +146,15 @@ def build_bond_clean_record(ticker: str, row: Dict[str, Any], meta: Optional[Dic
     }
 
 
-def build_yield_record(ticker: str, row: Dict[str, Any], meta: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def build_yield_record(
+    ticker: str,
+    row: Dict[str, Any],
+    meta: Optional[Dict[str, Any]],
+    currency: Optional[str] = None,
+) -> Dict[str, Any]:
     """§4.4 (codeada, no activada): base hist_raw + L2 metrics.
     `accured_interest` keeps the legacy ES typo on purpose (contract)."""
-    record = build_hist_raw_record(ticker, row, meta)
+    record = build_hist_raw_record(ticker, row, meta, currency=currency)
     extra = row.get("extra") or {}
     record.update({
         "tir": to_number(row.get("tir")),

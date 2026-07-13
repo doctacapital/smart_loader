@@ -149,19 +149,23 @@ class SmartLoader:
         """metadata_provider for PostgresReader (§5.3): enriches dwh bar rows
         with the legacy per-ticker fields dwh doesn't carry on eod_bar.
 
-        KNOWN GAP (flagged to orchestrator/planner, not invented here): the
+        NOTE on the §5.3 halt (resolved by planner): `currency` is NOT part
+        of this provider's contract anymore — PostgresReader sources it from
+        dwh.series.trade_currency (per-serie) and injects it directly into
+        the record, bypassing metadata_provider entirely. That's because the
         Tier1 `docta_tickers` DataFrame (ts:docta_tickers, Supabase `tickers`
         table) only has columns `tickers`/`market_type`/`submarket_type`/
         `name`/`sector`/*_id/`isin_code` — confirmed via nexus/utils.py and
-        cronos/services/redis_timeseries_service.py:540-542. It has NO
-        `currency`, `ticker_specie`/`specie`, or `current_closing_price`
-        column; those fields live only in real-time L2 quote payloads (see
-        cronos/utils/data_helpers.py:49-65), which SmartLoader's Tier 1 does
-        not load. So currency/specie/current_closing_price are returned as
-        None (spec's own sanctioned fallback for "provider doesn't find it").
-        submarket is populated from the real `submarket_type` column;
-        settlement_period uses the spec's explicit fallback constant "24hs"
-        (§5.3) since there is no per-ticker settlement column here either."""
+        cronos/services/redis_timeseries_service.py:540-542 — with no
+        per-ticker currency column at all.
+
+        `specie`/`current_closing_price` stay None permanently (planner
+        decision: their only historical source is real-time L2 quote
+        payloads — cronos/utils/data_helpers.py:49-65 — which SmartLoader's
+        Tier 1 never loads, and nothing downstream reads them materially).
+        `submarket` is populated from the real `submarket_type` column;
+        `settlement_period` uses the spec's explicit fallback constant
+        "24hs" (§5.3), ratified by the planner."""
         tickers_df = self._tier1_data.get("docta_tickers")
         if tickers_df is None or getattr(tickers_df, "empty", True):
             return None
@@ -174,7 +178,6 @@ class SmartLoader:
 
         row = match.iloc[0]
         return {
-            "currency": None,
             "specie": None,
             "submarket": row.get("submarket_type"),
             "current_closing_price": None,
