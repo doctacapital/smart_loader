@@ -25,6 +25,7 @@ dev = [
 [tool.pytest.ini_options]
 markers = [
     "pg: requires a real dwh Postgres instance (SMART_LOADER_TEST_PG_DSN)",
+    "slow: real-data / subprocess repro tests (DPM-815 T4) — not part of the fast loop",
 ]
 
 [build-system]
