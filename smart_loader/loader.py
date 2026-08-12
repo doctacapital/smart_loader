@@ -31,6 +31,20 @@ TIER2_CACHE_PREFIX = "ts:cache:"
 # TTL for per-ticker cache keys (safety net — cronos flush is the primary freshness mechanism)
 TIER2_CACHE_TTL = 86400  # 24 hours
 
+# Negative-cache (DPM-815 P0-A): key hermana del positivo, marca "se buscó y
+# no está" para no volver a materializar el Parquet completo en cada miss.
+# Sufijo, no campo de HASH ni STRING separada: convive sin romper lectores
+# v0.1.6 durante el bump escalonado (SPEC DPM-815 §3.1).
+TIER2_NEG_SUFFIX = ":__miss__"
+
+# TTL del marker negativo. Default 3600s (decisión de Tomás, revisable por env
+# sin rebuild — SPEC DPM-815 §0.1/§3.1).
+TIER2_NEG_CACHE_TTL_ENV = "SMART_LOADER_NEG_CACHE_TTL"
+TIER2_NEG_CACHE_TTL_DEFAULT = 3600
+
+# Kill-switch del negative-cache. "on"/"off", default "on".
+NEG_CACHE_ENABLED_ENV = "SMART_LOADER_NEG_CACHE"
+
 # Tier 1 tables stored as JSON-serialized DataFrames in Redis
 TIER1_DATAFRAME_KEYS = [
     "bonds",
@@ -102,6 +116,15 @@ class SmartLoader:
         # Fallback backend always built, regardless of SMART_LOADER_BACKEND — pg
         # only ever covers the tables listed in SMART_LOADER_PG_TABLES (DPM-395 §1).
         self._parquet_reader = ParquetReader(self._s3_bucket, self._s3_prefix)
+
+        # Negative-cache (DPM-815 P0-A): kill-switch + TTL, both env-configurable
+        # so the TTL can be raised without a package rebuild (SPEC §0.1).
+        self._neg_cache_enabled = (
+            os.environ.get(NEG_CACHE_ENABLED_ENV, "on").strip().lower() != "off"
+        )
+        self._neg_cache_ttl = int(
+            os.environ.get(TIER2_NEG_CACHE_TTL_ENV, TIER2_NEG_CACHE_TTL_DEFAULT)
+        )
 
         # Tier 1 data loaded at startup
         self._tier1_data: Dict[str, Any] = {}
@@ -261,6 +284,7 @@ class SmartLoader:
             List of dicts representing the ticker's time series records.
         """
         cache_key = f"{TIER2_CACHE_PREFIX}{table}:{ticker}"
+        neg_key = cache_key + TIER2_NEG_SUFFIX
 
         # 1. Check key type for backward compat
         key_type = self._redis.type(cache_key)
@@ -279,10 +303,29 @@ class SmartLoader:
                 self._cache_as_hash(cache_key, data)
                 return data
 
-        # 2. Cache miss — load from Tier 2 backend (pg or S3 Parquet), cache as hash
-        data = self._reader_for(table).read_ticker(table, ticker)
+        # 2. Negative-cache (DPM-815 P0-A): a marker here means an earlier,
+        # authoritative read already found nothing for this ticker. The
+        # positive branches above always run first (I-1), so this never
+        # shadows a real value written after the marker.
+        if self._neg_cache_enabled and self._redis.exists(neg_key):
+            return []
+
+        # 3. Cache miss — load from Tier 2 backend (pg or S3 Parquet), cache as hash
+        reader = self._reader_for(table)
+        data = reader.read_ticker(table, ticker)
         if data:
             self._cache_as_hash(cache_key, data)
+            if self._neg_cache_enabled:
+                self._redis.delete(neg_key)
+        elif self._neg_cache_enabled and _may_cache_negative(reader):
+            # Anti-poisoning (§3.5): only mark "doesn't exist" when the read
+            # was authoritative — never on an S3 error/timeout swallowed by
+            # the reader, which would otherwise cache a false negative for
+            # the full TTL.
+            try:
+                self._redis.setex(neg_key, self._neg_cache_ttl, "1")
+            except Exception as e:
+                logger.warning(f"Failed to set negative-cache marker {neg_key}: {e}")
 
         return data
 
@@ -438,6 +481,15 @@ class SmartLoader:
             count += 1
         logger.info(f"Flushed {count} Tier 2 cache keys")
         return count
+
+
+def _may_cache_negative(reader) -> bool:
+    """Anti-poisoning gate (SPEC DPM-815 §3.5): only readers that expose
+    `consume_degraded()` and report a clean (non-degraded) read are eligible
+    for a negative-cache write. Readers without the hook (e.g. PostgresReader)
+    are conservatively excluded — they never cache negatives."""
+    consume = getattr(reader, "consume_degraded", None)
+    return False if consume is None else not consume()
 
 
 def _deserialize_dataframe(json_str: str) -> pd.DataFrame:
