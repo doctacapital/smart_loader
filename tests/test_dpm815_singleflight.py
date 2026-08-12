@@ -5,7 +5,13 @@ T3/T10/T12/T14, plus the single-flight half of T11).
 
 Anti-placebo (§11): T3, T10, T12, T14 must FAIL against pre-fix code
 (pin `smart-loader @ v0.1.7`, byte-identical to main pre-DPM-815) — see
-coder report for the actual run.
+coder report for the actual run. T10 additionally carries a mutation
+control (planner-ratified) since it has no download counter to gate a
+placebo check on: `test_t10_mutation_control_in_place_mutation_corrupts_next_read`
+directly mutates the memoized DataFrame in place (the I-7 violation a
+buggy consumer could introduce) and shows a subsequent read comes back
+corrupted, proving the real T10 assertions are sensitive to that failure
+mode.
 """
 import io
 import threading
@@ -114,6 +120,41 @@ def test_t10_memoized_dataframe_not_mutated(real_parquet_reader):
         entry2 = pr_module._MEMO.get(memo_key)
     assert len(entry2[1]) == 288694
     assert real_parquet_reader._s3.get_object_calls == 1, "2nd read must be served from the memo"
+
+
+def test_t10_mutation_control_in_place_mutation_corrupts_next_read(real_parquet_reader):
+    """Mutation control (planner-ratified): T10 has no download counter of
+    its own to gate on, so per the planner's ruling its discriminating
+    mutation is "a consumer mutates the memoized DataFrame in place" (I-7
+    violation) — the real reader never does this (`df[df["ticker"] ==
+    ticker]` boolean-mask indexing always copies), so this directly mutates
+    the shared memo entry the way a bug would, and shows a SUBSEQUENT,
+    independent read comes back corrupted. Contrast with the real T10 test
+    above, where two reads through the same (unmutated) memo both return
+    881 correct rows."""
+    from smart_loader import parquet_reader as pr_module
+
+    r1 = real_parquet_reader.read_ticker("yield_by_ticker", "AL30")
+    assert len(r1) == 881
+
+    memo_key = f"{real_parquet_reader._bucket}/v1/yield_bonds/by_ticker.parquet"
+    with pr_module._MEMO_LOCK:
+        memoized_df = pr_module._MEMO[memo_key][1]
+
+    # Simulate the I-7 violation: a consumer mutates the memoized DF in
+    # place (e.g. `df.drop(..., inplace=True)` instead of boolean-mask
+    # filtering, which would copy).
+    memoized_df.drop(memoized_df.index, inplace=True)
+
+    with pr_module._MEMO_LOCK:
+        assert len(pr_module._MEMO[memo_key][1]) == 0, (
+            "the corruption is visible in the shared memo entry itself"
+        )
+
+    r2 = real_parquet_reader.read_ticker("yield_by_ticker", "AL30")
+    assert r2 == [], (
+        "control: proves T10 would catch a consumer mutating the memoized DF in place (I-7)"
+    )
 
 
 # ── T11 (single-flight half) — kill switch ──────────────────────────────
