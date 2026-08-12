@@ -1,4 +1,24 @@
 __pycache__/
 .venv/
+.venv-test/
 *.egg-info/
 .pytest_cache/
+
+# Poetry artifact from another repo — this package builds with setuptools
+# (pyproject.toml [build-system]), not poetry. If it reappears, delete it
+# freely; nothing here reads it.
+poetry.lock
+
+# Golden fixtures for tests/test_golden.py (DPM-395 §7.3), captured manually
+# against prod creds via scripts/capture_golden.py. ~7.5 MB of binary/SQL
+# fixtures — not worth shipping in a package installed via git by 4 repos.
+# Regenerate locally with:
+#   python scripts/capture_golden.py
+# test_golden.py already pytest.skip()s cleanly when a fixture is missing.
+tests/golden/
+
+# Real by_ticker.parquet fixture for the DPM-815 P0-A/P0-B suite (SPEC §11).
+# ~28 MB, copied from s3://docta-db-tables-025066256977/v1/yield_bonds/by_ticker.parquet.
+# The conftest fixture pytest.skip()s cleanly when it's missing, printing
+# that same S3 path.
+tests/fixtures/by_ticker_real.parquet
