@@ -11,7 +11,9 @@ TTL 24h on per-ticker keys is a safety net only.
 import json
 import logging
 import os
-from datetime import datetime
+import time
+import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -78,6 +80,57 @@ TIER1_DICT_KEYS = [
 
 # Dict keys where JSON string keys should be converted back to int
 INT_KEY_TABLES = {"tickers_issuers", "tickers_laws", "tickers_sectors"}
+
+# ── yield_by_date por fecha (DPM-1388) ──
+# La curva histórica se guarda como un HASH con un campo por fecha, armado por
+# un solo proceso a la vez (candado compartido en Redis) y publicado completo
+# o nada. Reemplaza al STRING `ts:cache:yield_by_date:__all__` (~215 MB, una
+# escritura por worker en paralelo el 6-10 → desalojo de tablas fijas).
+#
+# Las dos claves `ts:cache:yield_by_date:*` caen en el borrado diario de
+# cronos fase B. El candado vive fuera de `ts:` a propósito: ni el borrado de
+# cronos ni la captura local de `ts:*` lo tocan.
+YIELD_BY_DATE_TABLE = "yield_by_date"
+YIELD_BY_DATE_KEY = f"{TIER2_CACHE_PREFIX}{YIELD_BY_DATE_TABLE}:__by_date__"
+YIELD_BY_DATE_BUILDING_PREFIX = f"{TIER2_CACHE_PREFIX}{YIELD_BY_DATE_TABLE}:__building__:"
+YIELD_BY_DATE_LOCK_KEY = "lock:smart_loader:yield_by_date"
+YIELD_BY_DATE_META_FIELD = "__meta__"
+
+YIELD_BY_DATE_TTL = TIER2_CACHE_TTL          # hash publicado: 86400 s
+YIELD_BY_DATE_BUILDING_TTL = 300             # temporal: renovado en cada tanda
+YIELD_BY_DATE_LOCK_TTL = 120                 # ~7 veces el armado medido (16,6 s)
+YIELD_BY_DATE_BATCH_DATES = 50               # fechas por tanda de HSET
+YIELD_BY_DATE_WAIT_S = 25.0                  # docto corta a 30 s
+YIELD_BY_DATE_POLL_S = 0.5
+
+# Publica la temporal solo si está completa (N fechas + __meta__); si no, la
+# borra. RENAME + EXPIRE en el mismo script: nadie ve la final sin vencimiento.
+# Los dos scripts van con EVAL (no EVALSHA): corren una vez por armado, y así
+# no dependen del cache de scripts del servidor (se vacía en un failover).
+_PUBLISH_YIELD_BY_DATE_LUA = """
+if redis.call('HLEN', KEYS[1]) == tonumber(ARGV[1]) then
+    redis.call('RENAME', KEYS[1], KEYS[2])
+    redis.call('EXPIRE', KEYS[2], tonumber(ARGV[2]))
+    return 1
+end
+redis.call('DEL', KEYS[1])
+return 0
+"""
+
+# Suelta el candado solo si sigue siendo nuestro (compare-and-delete).
+_RELEASE_LOCK_LUA = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+
+
+class YieldCacheBuilding(Exception):
+    """Otro proceso está armando `yield_by_date` y no terminó dentro de la
+    espera máxima (YIELD_BY_DATE_WAIT_S). nexus lo traduce a 503 con
+    Retry-After."""
+
 
 # Tier 2 table name mapping: SmartLoader name → S3 Parquet path prefix
 TIER2_TABLES = {
@@ -430,6 +483,11 @@ class SmartLoader:
 
         Returns:
             Dict mapping ticker → list of records (same structure as current DB_TABLES).
+
+        VIEJO para yield_by_date (DPM-1388): usar `get_yield_for_date`. La rama
+        `yield_by_date` de acá (STRING `ts:cache:yield_by_date:__all__`, ~215 MB,
+        sin candado entre procesos) queda solo por compatibilidad y se borra en
+        una versión posterior.
         """
         # For yield_by_date, the structure is {date_str: {submarket: [records]}} — no market partition
         if table == "yield_by_date":
@@ -451,6 +509,174 @@ class SmartLoader:
                 self._cache_as_hash(cache_key, records)
 
         return all_tickers or {}
+
+    # ── yield_by_date por fecha, con candado entre procesos (DPM-1388) ──
+
+    def get_yield_for_date(self, date_str: str) -> Optional[Dict[str, List[Dict]]]:
+        """Curva histórica de una fecha: `{submarket: [registros]}`, o None si
+        la tabla no tiene esa fecha.
+
+        BLOQUEA: puede hacer I/O de Redis y S3 y esperar hasta
+        YIELD_BY_DATE_WAIT_S segundos a que otro proceso termine de armar la
+        tabla. Desde código async hay que llamarlo fuera del bucle de eventos
+        (`run_in_threadpool` / `asyncio.to_thread`).
+
+        1. `HMGET __by_date__ <fecha> __meta__` en un solo comando:
+           - `__meta__` y la fecha presentes → devuelve la fecha;
+           - `__meta__` presente y la fecha no → None, sin rearmar;
+           - `__meta__` ausente → la tabla no está publicada: se arma.
+        2. Arma un solo proceso, el que gana `SET lock NX EX 120`. Los demás
+           esperan (ver `_wait_for_yield_by_date`).
+
+        Raises:
+            YieldCacheBuilding: otro proceso tiene el candado y la tabla no
+                apareció dentro de la espera máxima.
+        """
+        published, value = self._hmget_yield_by_date(date_str)
+        if published:
+            return value
+
+        token = uuid.uuid4().hex
+        if self._try_acquire_yield_lock(token):
+            return self._build_yield_by_date(date_str, token)
+        return self._wait_for_yield_by_date(date_str)
+
+    def _hmget_yield_by_date(self, date_str: str) -> Tuple[bool, Optional[Dict]]:
+        """(publicada, valor). Un solo HMGET: sin carrera con el RENAME de otro
+        proceso entre "¿está la fecha?" y "¿está la tabla?"."""
+        raw_date, raw_meta = self._redis.hmget(
+            YIELD_BY_DATE_KEY, date_str, YIELD_BY_DATE_META_FIELD
+        )
+        if raw_meta is None:
+            return False, None
+        if raw_date is None:
+            return True, None
+        return True, json.loads(raw_date)
+
+    def _try_acquire_yield_lock(self, token: str) -> bool:
+        return bool(
+            self._redis.set(
+                YIELD_BY_DATE_LOCK_KEY, token, nx=True, ex=YIELD_BY_DATE_LOCK_TTL
+            )
+        )
+
+    def _release_yield_lock(self, token: str) -> None:
+        """Borra el candado solo si sigue teniendo nuestro token: si venció y
+        lo tomó otro proceso, no se lo sacamos."""
+        try:
+            self._redis.eval(_RELEASE_LOCK_LUA, 1, YIELD_BY_DATE_LOCK_KEY, token)
+        except redis.RedisError as e:
+            # Vence solo a los YIELD_BY_DATE_LOCK_TTL segundos.
+            logger.warning(f"yield_by_date lock_release_failed pid={os.getpid()}: {e}")
+
+    def _build_yield_by_date(self, date_str: str, token: str) -> Optional[Dict]:
+        """Con el candado tomado: vuelve a mirar, lee la tabla entera, la
+        publica y suelta el candado. Contesta el pedido desde memoria."""
+        try:
+            # Doble chequeo: otro proceso pudo publicar entre nuestro HMGET y
+            # el SET NX (soltó el candado justo antes de que lo tomáramos).
+            published, value = self._hmget_yield_by_date(date_str)
+            if published:
+                return value
+
+            t0 = time.monotonic()
+            data = self._reader_for(YIELD_BY_DATE_TABLE).read_full_table(YIELD_BY_DATE_TABLE)
+            if not data:
+                logger.warning(
+                    f"yield_by_date build_empty pid={os.getpid()}: "
+                    f"read_full_table vacío, no se escribe nada"
+                )
+                return None
+
+            published_ok = self._publish_yield_by_date(data, token)
+            logger.info(
+                f"yield_by_date build published={int(published_ok)} dates={len(data)} "
+                f"dur_ms={int((time.monotonic() - t0) * 1000)} pid={os.getpid()}"
+            )
+            return data.get(date_str)
+        finally:
+            self._release_yield_lock(token)
+
+    def _publish_yield_by_date(self, data: Dict[str, Any], token: str) -> bool:
+        """Escribe la temporal en tandas y la publica con Lua solo si quedó
+        completa. False si no se publicó (temporal borrada o desalojada a
+        mitad de camino, o Redis rechazó la escritura): el que armó contesta
+        igual desde memoria."""
+        building_key = f"{YIELD_BY_DATE_BUILDING_PREFIX}{token}"
+        dates = list(data.keys())
+        meta = {
+            "built_at": datetime.now(timezone.utc).isoformat(),
+            "dates": len(dates),
+            "rows": sum(_count_records(v) for v in data.values()),
+            "max_date": max(dates),
+        }
+        try:
+            for start in range(0, len(dates), YIELD_BY_DATE_BATCH_DATES):
+                chunk = dates[start:start + YIELD_BY_DATE_BATCH_DATES]
+                mapping = {d: json.dumps(data[d], default=str) for d in chunk}
+                if start + YIELD_BY_DATE_BATCH_DATES >= len(dates):
+                    mapping[YIELD_BY_DATE_META_FIELD] = json.dumps(meta)
+                self._write_yield_building_batch(building_key, mapping)
+
+            published = self._redis.eval(
+                _PUBLISH_YIELD_BY_DATE_LUA, 2, building_key, YIELD_BY_DATE_KEY,
+                len(dates) + 1, YIELD_BY_DATE_TTL,
+            )
+        except redis.RedisError as e:
+            logger.warning(
+                f"yield_by_date publish_failed pid={os.getpid()}: {e} "
+                f"(se contesta desde memoria)"
+            )
+            try:
+                self._redis.delete(building_key)
+            except redis.RedisError:
+                pass  # vence sola a los YIELD_BY_DATE_BUILDING_TTL segundos
+            return False
+
+        if int(published) != 1:
+            logger.warning(
+                f"yield_by_date publish_incomplete pid={os.getpid()}: la temporal "
+                f"desapareció a mitad del armado, no se publica (se contesta desde memoria)"
+            )
+            return False
+        return True
+
+    def _write_yield_building_batch(self, building_key: str, mapping: Dict[str, str]) -> None:
+        """Una tanda: HSET + EXPIRE en MULTI/EXEC. Si la temporal se borró
+        entre tandas, el HSET la recrea pero nunca queda sin vencimiento."""
+        pipe = self._redis.pipeline(transaction=True)
+        pipe.hset(building_key, mapping=mapping)
+        pipe.expire(building_key, YIELD_BY_DATE_BUILDING_TTL)
+        pipe.execute()
+
+    def _wait_for_yield_by_date(self, date_str: str) -> Optional[Dict]:
+        """Perdió el candado: mira cada YIELD_BY_DATE_POLL_S con el mismo HMGET
+        hasta YIELD_BY_DATE_WAIT_S. Si el candado desaparece sin que la tabla
+        aparezca (el que armaba falló o murió), intenta tomarlo una sola vez."""
+        deadline = time.monotonic() + YIELD_BY_DATE_WAIT_S
+        retried = False
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning(
+                    f"yield_by_date wait_timeout wait_s={YIELD_BY_DATE_WAIT_S} pid={os.getpid()}"
+                )
+                raise YieldCacheBuilding(
+                    f"yield_by_date is being built by another process "
+                    f"(waited {YIELD_BY_DATE_WAIT_S:g}s)"
+                )
+            time.sleep(min(YIELD_BY_DATE_POLL_S, remaining))
+
+            published, value = self._hmget_yield_by_date(date_str)
+            if published:
+                return value
+
+            if not retried and not self._redis.exists(YIELD_BY_DATE_LOCK_KEY):
+                retried = True
+                token = uuid.uuid4().hex
+                if self._try_acquire_yield_lock(token):
+                    logger.info(f"yield_by_date lock_taken_after_wait pid={os.getpid()}")
+                    return self._build_yield_by_date(date_str, token)
 
     # ── Special operations ──
 
@@ -490,6 +716,16 @@ def _may_cache_negative(reader) -> bool:
     are conservatively excluded — they never cache negatives."""
     consume = getattr(reader, "consume_degraded", None)
     return False if consume is None else not consume()
+
+
+def _count_records(date_value: Any) -> int:
+    """Registros de una fecha de yield_by_date: `{submarket: [registros]}`,
+    o una lista plana si el parquet no trae `submarket`."""
+    if isinstance(date_value, dict):
+        return sum(len(v) for v in date_value.values() if isinstance(v, list))
+    if isinstance(date_value, list):
+        return len(date_value)
+    return 0
 
 
 def _deserialize_dataframe(json_str: str) -> pd.DataFrame:
